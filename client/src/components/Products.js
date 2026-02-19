@@ -406,6 +406,11 @@ function Products() {
       const hsnCodeValue = selectedCategory?.hsnCode || formData.hsnCode || '';
 
       // Clean up empty values
+      const urlImages = formData.images.filter((img) => img.trim() !== '');
+      const hasFileUploads = uploadedFilesRef.current.length > 0 || uploadedFiles.length > 0;
+      // Backend requires at least one image; when only files selected, pass placeholder until upload completes
+      const imagesForCreate = urlImages.length > 0 ? urlImages : (hasFileUploads ? ['_file_upload_pending_'] : []);
+      
       const submitData = {
         ...formData,
         // Clear parentSkuOrAsin if variation is NO
@@ -415,7 +420,7 @@ function Products() {
         subCategory: formData.subCategory || null,
         hsnCode: hsnCodeValue,
         bulletPoints: formData.bulletPoints.filter((bp) => bp.trim() !== ''),
-        images: formData.images.filter((img) => img.trim() !== ''),
+        images: imagesForCreate,
         keywords: formData.keywords.filter((kw) => kw.trim() !== ''),
         productDimensionCm: Object.values(formData.productDimensionCm).every(
           (v) => v === ''
@@ -449,10 +454,10 @@ function Products() {
       // Upload images if any files were selected
       if ((uploadedFilesRef.current.length > 0 || uploadedFiles.length > 0) && productId) {
         const uploadedPaths = await handleImageUpload(productId);
-        // Add uploaded paths to submitData for final update
         if (uploadedPaths.length > 0) {
-          submitData.images = [...submitData.images, ...uploadedPaths];
-          await productsAPI.update(productId, { images: submitData.images });
+          // Replace placeholder with real paths; merge with any URL images
+          const finalImages = [...urlImages, ...uploadedPaths];
+          await productsAPI.update(productId, { images: finalImages });
         }
       }
       
