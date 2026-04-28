@@ -18,6 +18,7 @@ const ExcelUpload = ({
   const [error, setError] = useState(null);
   const [showAllErrors, setShowAllErrors] = useState(false);
   const [filterLogFailedOnly, setFilterLogFailedOnly] = useState(false);
+  const [downloadingReport, setDownloadingReport] = useState(false);
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
@@ -282,6 +283,22 @@ const ExcelUpload = ({
                   <span className="stat-value">{result.failed || 0}</span>
                 </div>
               </div>
+
+              {result.importReport?.reportId && (
+                <div className="import-report-download-section">
+                  <button
+                    type="button"
+                    className="download-import-report-btn"
+                    onClick={handleDownloadImportReport}
+                    disabled={downloadingReport}
+                  >
+                    {downloadingReport ? 'Preparing download…' : 'Download details Excel (all rows + status + reasons)'}
+                  </button>
+                  <p className="import-report-hint">
+                    Spreadsheet includes every uploaded row, import status, failure reasons, and notes (e.g. assigned SR No).
+                  </p>
+                </div>
+              )}
 
               {result.failedRows && result.failedRows.length > 0 && (
                 <div className="failed-rows-hint">

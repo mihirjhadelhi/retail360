@@ -39,6 +39,8 @@ export const productsAPI = {
   delete: (id) => api.delete(`/products/${id}`),
   downloadTemplate: () => api.get('/products/template', { responseType: 'blob' }),
   import: (formData) => api.post('/products/import', formData, { headers: { 'Content-Type': 'multipart/form-data' } }),
+  downloadImportReport: (reportId) =>
+    api.get(`/products/import-report/${reportId}`, { responseType: 'blob' }),
   uploadImages: (id, formData) => uploadApi.post(`/products/${id}/images`, formData),
 };
 

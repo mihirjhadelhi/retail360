@@ -3,6 +3,7 @@ const router = express.Router();
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const Product = require('../models/Product');
 const Category = require('../models/Category');
 const Subcategory = require('../models/Subcategory');
@@ -11,10 +12,11 @@ const logger = require('../utils/logger');
 const { paginate } = require('../utils/pagination');
 const { requirePermission } = require('../middleware/auth');
 const { parseExcel, validateExcelData } = require('../utils/excelParser');
-const { generateTemplate, exportToExcel } = require('../utils/excelGenerator');
+const { generateTemplate, exportJsonRowsToExcelBuffer } = require('../utils/excelGenerator');
 
 // File management utilities
 const UPLOADS_DIR = path.join(__dirname, '..', 'uploads', 'products');
+const IMPORT_REPORTS_DIR = path.join(__dirname, '..', 'uploads', 'products', 'import-reports');
 
 // Ensure uploads directory exists
 function ensureDirectoryExists(dirPath) {
@@ -302,6 +304,30 @@ router.get('/template', requirePermission('products.view'), (req, res) => {
   }
 });
 
+// GET product import detail report (Excel); must be before /:id
+router.get('/import-report/:reportId', requirePermission('products.view'), (req, res) => {
+  try {
+    const { reportId } = req.params;
+    if (!/^[a-f0-9]{32}$/i.test(reportId)) {
+      return res.status(400).json({ error: 'Invalid report id' });
+    }
+    const filePath = path.join(IMPORT_REPORTS_DIR, `${reportId}.xlsx`);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+    const downloadName = `product_import_details_${reportId.slice(0, 8)}.xlsx`;
+    res.download(filePath, downloadName, (err) => {
+      if (err) {
+        logger.backend.error('Error sending import report', { error: err.message, reportId });
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to download report' });
+      }
+    });
+  } catch (error) {
+    logger.backend.error('Import report download error', { error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // GET single product
 router.get('/:id', requirePermission('products.view'), async (req, res) => {
   try {
@@ -554,6 +580,63 @@ async function resolveCategoryAndSubcategory(categoryName, subCategoryName) {
   return { categoryId, subCategoryId, hsnCode, error: null };
 }
 
+// Build row-wise import report: original sheet columns + status + failure reason + notes (e.g. SR No)
+function buildProductImportReportRows(excelData, uploadLog) {
+  const keyOrder = [];
+  const seen = new Set();
+  for (const row of excelData) {
+    for (const k of Object.keys(row)) {
+      if (!seen.has(k)) {
+        seen.add(k);
+        keyOrder.push(k);
+      }
+    }
+  }
+
+  const importStatusLabel = (action) => {
+    if (action === 'failed') return 'Failed';
+    if (action === 'imported') return 'Imported';
+    if (action === 'updated') return 'Updated';
+    return '';
+  };
+
+  return excelData.map((row, i) => {
+    const log = uploadLog[i] || {};
+    const out = { 'Row #': i + 2 };
+    for (const k of keyOrder) {
+      const v = row[k];
+      if (v === null || v === undefined) out[k] = '';
+      else if (typeof v === 'object') out[k] = JSON.stringify(v);
+      else out[k] = String(v);
+    }
+    out['Import Status'] = importStatusLabel(log.action);
+    out['Failure Reason'] = log.action === 'failed' ? (log.message || '') : '';
+    if (log.action === 'imported' && log.slno != null && log.slno !== '') {
+      out['Notes'] = `Assigned SR No: ${log.slno}`;
+    } else if (log.action === 'updated') {
+      out['Notes'] = 'Existing product updated';
+    } else {
+      out['Notes'] = '';
+    }
+    return out;
+  });
+}
+
+function sanitizeImportReportDownloadBaseName(originalName) {
+  const base = (originalName || 'upload').replace(/\.[^/.]+$/, '');
+  return base.replace(/[^\w\-.\s()]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80) || 'upload';
+}
+
+/** Read numeric dimension from Excel; supports template headers with or without trailing ` *`. */
+function parseExcelDimensionCm(row, labelBase) {
+  const starKey = `${labelBase} *`;
+  const plainKey = labelBase;
+  const raw = row[starKey] ?? row[plainKey];
+  if (raw === undefined || raw === null || String(raw).trim() === '') return undefined;
+  const n = parseFloat(String(raw).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : undefined;
+}
+
 // Helper: Extract user-friendly error message from Mongoose/validation errors
 function getReadableErrorMessage(error) {
   if (!error) return 'Unknown error';
@@ -612,7 +695,7 @@ router.post('/import', requirePermission('products.create'), upload.single('file
       }
       allUnits = await Unit.find({}).select('name').lean();
     }
-    const validUnitNames = new Set(allUnits.map(u => u.name.toLowerCase()));
+    const validUnitNames = new Set(allUnits.map((u) => u.name.toLowerCase()));
 
     // Process each row
     for (let i = 0; i < excelData.length; i++) {
@@ -623,7 +706,9 @@ router.post('/import', requirePermission('products.create'), upload.single('file
 
       try {
         // Validate unit (mandatory - must be before productData)
-        const unitInput = (row['Unit'] || '').toString().trim();
+        const unitInput = (row['Unit *'] || row['Unit'] || row['unit'] || '')
+          .toString()
+          .trim();
         if (!unitInput) {
           errors.push({ row: rowNum, field: 'unit', message: 'Unit is required', data: row });
           uploadLog.push({ row: rowNum, name: rowName, sku: rowSku, action: 'failed', message: 'Unit is required' });
@@ -631,31 +716,39 @@ router.post('/import', requirePermission('products.create'), upload.single('file
           continue;
         }
         if (!validUnitNames.has(unitInput.toLowerCase())) {
-          errors.push({ row: rowNum, field: 'unit', message: `Unit "${unitInput}" not found. Add it in Unit Master first.`, data: row });
+          errors.push({
+            row: rowNum,
+            field: 'unit',
+            message: `Unit "${unitInput}" not found. Add it in Unit Master first.`,
+            data: row
+          });
           uploadLog.push({ row: rowNum, name: rowName, sku: rowSku, action: 'failed', message: `Unit "${unitInput}" not found` });
           failed++;
           continue;
         }
 
         // Map Excel columns to product fields (SL No is optional - auto-generated when missing)
+        // Template uses `Column *`; support both that and plain headers for older files.
+        const weightRaw = row['Weight (kg) *'] ?? row['Weight (kg)'];
+        const imagesRaw = row['Images (comma-separated URLs) *'] ?? row['Images (comma-separated URLs)'];
         const productData = {
-          slno: row['SL No'] ? parseInt(row['SL No']) : undefined,
+          slno: row['SL No'] ? parseInt(row['SL No'], 10) : undefined,
           parentSkuOrAsin: row['Parent SKU/ASIN'] || '',
           variation: row['Variation'] || '',
-          sku: row['SKU *'] || '',
+          sku: row['SKU *'] || row['SKU'] || '',
           ean: row['EAN'] || '',
-          category: (row['Category'] || '').toString().trim() || undefined,
-          subCategory: (row['Sub Category'] || '').toString().trim() || undefined,
-          brandName: row['Brand Name'] || '',
+          category: (row['Category *'] || row['Category'] || '').toString().trim() || undefined,
+          subCategory: (row['Sub Category *'] || row['Sub Category'] || '').toString().trim() || undefined,
+          brandName: row['Brand Name *'] || row['Brand Name'] || '',
           title: row['Title'] || '',
-          name: row['Name *'] || '',
-          colour: row['Colour'] || '',
-          material: row['Material'] || '',
-          size: row['Size'] || '',
-          hsnCode: row['HSN Code'] || '',
+          name: row['Name *'] || row['name'] || '',
+          colour: row['Colour *'] || row['Colour'] || '',
+          material: row['Material *'] || row['Material'] || '',
+          size: row['Size *'] || row['Size'] || '',
+          hsnCode: (row['HSN Code *'] || row['HSN Code'] || '').toString().trim(),
           description: row['Description'] || '',
-          manufacturerName: row['Manufacturer Name'] || '',
-          contactDetails: row['Contact Details'] || '',
+          manufacturerName: row['Manufacturer Name *'] || row['Manufacturer Name'] || '',
+          contactDetails: row['Contact Details *'] || row['Contact Details'] || '',
           bulletPoints: [
             row['Bullet Point 1'] || '',
             row['Bullet Point 2'] || '',
@@ -664,20 +757,24 @@ router.post('/import', requirePermission('products.create'), upload.single('file
             row['Bullet Point 5'] || ''
           ].filter(bp => bp),
           productDimensionCm: {
-            length: row['Product Dimension Length (cm)'] ? parseFloat(row['Product Dimension Length (cm)']) : undefined,
-            width: row['Product Dimension Width (cm)'] ? parseFloat(row['Product Dimension Width (cm)']) : undefined,
-            height: row['Product Dimension Height (cm)'] ? parseFloat(row['Product Dimension Height (cm)']) : undefined
+            length: parseExcelDimensionCm(row, 'Product Dimension Length (cm)'),
+            width: parseExcelDimensionCm(row, 'Product Dimension Width (cm)'),
+            height: parseExcelDimensionCm(row, 'Product Dimension Height (cm)')
           },
           packageDimensionCm: {
-            length: row['Package Dimension Length (cm)'] ? parseFloat(row['Package Dimension Length (cm)']) : undefined,
-            width: row['Package Dimension Width (cm)'] ? parseFloat(row['Package Dimension Width (cm)']) : undefined,
-            height: row['Package Dimension Height (cm)'] ? parseFloat(row['Package Dimension Height (cm)']) : undefined
+            length: parseExcelDimensionCm(row, 'Package Dimension Length (cm)'),
+            width: parseExcelDimensionCm(row, 'Package Dimension Width (cm)'),
+            height: parseExcelDimensionCm(row, 'Package Dimension Height (cm)')
           },
-          weight: row['Weight (kg)'] ? parseFloat(row['Weight (kg)']) : undefined,
+          weight: weightRaw !== undefined && weightRaw !== null && String(weightRaw).trim() !== ''
+            ? parseFloat(String(weightRaw).replace(/,/g, ''))
+            : undefined,
           unit: unitInput,
           shape: row['Shape'] || '',
           specialFeature: row['Special Feature'] || '',
-          images: row['Images (comma-separated URLs)'] ? row['Images (comma-separated URLs)'].split(',').map(url => url.trim()) : []
+          images: imagesRaw
+            ? String(imagesRaw).split(',').map((url) => url.trim()).filter(Boolean)
+            : []
         };
 
         // Resolve Category and Subcategory by name to ObjectIds
@@ -819,6 +916,26 @@ router.post('/import', requirePermission('products.create'), upload.single('file
     // Collect failed row numbers for quick reference
     const failedRows = uploadLog.filter(e => e.action === 'failed').map(e => e.row);
 
+    // Item-wise Excel report (original columns + status + failure reason + notes)
+    let importReport = null;
+    try {
+      const detailRows = buildProductImportReportRows(excelData, uploadLog);
+      const reportBuffer = exportJsonRowsToExcelBuffer(detailRows, 'Import Details');
+      const reportId = crypto.randomBytes(16).toString('hex');
+      ensureDirectoryExists(IMPORT_REPORTS_DIR);
+      fs.writeFileSync(path.join(IMPORT_REPORTS_DIR, `${reportId}.xlsx`), reportBuffer);
+      const baseName = sanitizeImportReportDownloadBaseName(req.file?.originalname);
+      importReport = {
+        reportId,
+        suggestedFileName: `product_import_details_${baseName}_${reportId.slice(0, 8)}.xlsx`.replace(/\s+/g, '_')
+      };
+    } catch (reportErr) {
+      logger.backend.error('Failed to write product import report file', {
+        error: reportErr.message,
+        stack: reportErr.stack
+      });
+    }
+
     res.json({
       success: true,
       imported,
@@ -827,7 +944,10 @@ router.post('/import', requirePermission('products.create'), upload.single('file
       failedRows: [...new Set(failedRows)].sort((a, b) => a - b),
       errors: errors.slice(0, 200),
       uploadLog: uploadLog.slice(0, 500),
-      summary: failed > 0 ? `Import completed. ${failed} row(s) failed - check Errors section and Upload Log for details.` : 'Import completed successfully.'
+      importReport,
+      summary: failed > 0
+        ? `Import completed. ${failed} row(s) failed${importReport ? ' — use Download details Excel for row-level reasons.' : '.'}`
+        : `Import completed successfully.${importReport ? ' Use Download details Excel to save a full row-by-row report.' : ''}`
     });
   } catch (error) {
     logger.backend.error('Error importing products', { error: error.message, stack: error.stack });

@@ -79,6 +79,41 @@
   background-color: #218838;
 }
 
+.import-report-download-section {
+  margin: 16px 0;
+  padding: 12px 0;
+  border-top: 1px solid #e9ecef;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.download-import-report-btn {
+  padding: 10px 16px;
+  background-color: #0d6efd;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  width: 100%;
+  transition: background-color 0.2s;
+}
+
+.download-import-report-btn:hover:not(:disabled) {
+  background-color: #0b5ed7;
+}
+
+.download-import-report-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.import-report-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #6c757d;
+  line-height: 1.4;
+}
+
 .file-drop-zone {
   border: 2px dashed #ced4da;
   border-radius: 8px;
